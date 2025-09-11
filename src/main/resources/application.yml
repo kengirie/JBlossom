@@ -1,0 +1,14 @@
+spring:
+  application:
+    name: JBlossom
+
+blossom:
+  database:
+    path: ./data/sqlite.db
+  storage:
+    path: ./data/blobs
+    max-file-size: 100MB
+  cors:
+    allowed-origins: "*"
+    allowed-methods: GET,HEAD,POST,PUT,DELETE,OPTIONS
+    allowed-headers: Authorization,Content-Type,X-SHA-256
