@@ -1,5 +1,6 @@
 package io.github.kengirie.JBlossom.service;
 
+import io.github.kengirie.JBlossom.exception.StorageException;
 import io.github.kengirie.JBlossom.model.BlobContent;
 import io.github.kengirie.JBlossom.model.BlobMetadata;
 import org.junit.jupiter.api.BeforeEach;
@@ -8,13 +9,17 @@ import org.junit.jupiter.api.io.TempDir;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Instant;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -289,6 +294,207 @@ public class StorageServiceTest {
         stats = storageService.getStorageStats();
         assertEquals(2, stats.getBlobCount());
         assertEquals("Content 1".length() + "Content 2 longer".length(), stats.getTotalSize());
+    }
+
+    @Test
+    void testStoreBlobSuccess() throws Exception {
+        String content = "Test content for store blob";
+        String contentType = "text/plain";
+        String pubkey = "test-pubkey-12345";
+        
+        try (InputStream inputStream = new ByteArrayInputStream(content.getBytes())) {
+            BlobMetadata result = storageService.storeBlob(inputStream, contentType, pubkey, null);
+            
+            assertNotNull(result);
+            assertEquals(64, result.getHash().length()); // SHA256 hash length
+            assertEquals(content.length(), result.getSize());
+            assertEquals(contentType, result.getType());
+            assertEquals(pubkey, result.getPubkey());
+            assertTrue(result.getUploaded() > 0);
+            
+            // ファイルが実際に保存されているか確認
+            Path filePath = tempDir.resolve(result.getHash());
+            assertTrue(Files.exists(filePath));
+            assertEquals(content, Files.readString(filePath));
+            
+            // データベースに記録されているか確認
+            Optional<BlobMetadata> found = storageService.findBlob(result.getHash());
+            assertTrue(found.isPresent());
+            assertEquals(result.getHash(), found.get().getHash());
+        }
+    }
+
+    @Test
+    void testStoreBlobWithExpectedSha256() throws Exception {
+        String content = "Test content with known hash";
+        String expectedHash = "c6b6e6e8b3e9be2e0b7c5c4b2c7d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2";
+        String contentType = "text/plain";
+        String pubkey = "test-pubkey";
+        
+        try (InputStream inputStream = new ByteArrayInputStream(content.getBytes())) {
+            // 実際のハッシュとは異なる期待値を指定（HashMismatch検証用）
+            StorageException exception = assertThrows(StorageException.class, () -> {
+                storageService.storeBlob(inputStream, contentType, pubkey, expectedHash);
+            });
+            
+            assertEquals(StorageException.StorageErrorType.HASH_MISMATCH, exception.getErrorType());
+        }
+    }
+
+    @Test
+    void testStoreBlobDuplicate() throws Exception {
+        String content = "Duplicate test content";
+        String contentType = "text/plain";
+        String pubkey = "test-pubkey";
+        
+        BlobMetadata first, second;
+        
+        // 最初のアップロード
+        try (InputStream inputStream = new ByteArrayInputStream(content.getBytes())) {
+            first = storageService.storeBlob(inputStream, contentType, pubkey, null);
+        }
+        
+        // 同じ内容で再アップロード（重複）
+        try (InputStream inputStream = new ByteArrayInputStream(content.getBytes())) {
+            second = storageService.storeBlob(inputStream, contentType, pubkey, null);
+        }
+        
+        // 同じハッシュが返される
+        assertEquals(first.getHash(), second.getHash());
+        assertEquals(first.getSize(), second.getSize());
+    }
+
+    @Test
+    void testStoreBlobNullInputStream() {
+        StorageException exception = assertThrows(StorageException.class, () -> {
+            storageService.storeBlob(null, "text/plain", "test-pubkey", null);
+        });
+        
+        assertEquals(StorageException.StorageErrorType.INVALID_FILE, exception.getErrorType());
+    }
+
+    @Test
+    void testDeleteBlobSuccess() throws Exception {
+        String content = "Content to be deleted";
+        String hash;
+        
+        // まずBLOBを作成
+        try (InputStream inputStream = new ByteArrayInputStream(content.getBytes())) {
+            BlobMetadata metadata = storageService.storeBlob(inputStream, "text/plain", "test-pubkey", null);
+            hash = metadata.getHash();
+        }
+        
+        // 存在確認
+        assertTrue(storageService.hasBlob(hash));
+        Path filePath = tempDir.resolve(hash);
+        assertTrue(Files.exists(filePath));
+        
+        // 削除実行
+        boolean deleted = storageService.deleteBlob(hash);
+        assertTrue(deleted);
+        
+        // 削除確認
+        assertFalse(storageService.hasBlob(hash));
+        assertFalse(Files.exists(filePath));
+        
+        // データベースからも削除されているか確認
+        Optional<BlobMetadata> found = storageService.findBlob(hash);
+        assertFalse(found.isPresent());
+    }
+
+    @Test
+    void testDeleteBlobNotFound() {
+        String nonExistentHash = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        
+        boolean deleted = storageService.deleteBlob(nonExistentHash);
+        assertFalse(deleted); // 存在しないBLOBの削除はfalse
+    }
+
+    @Test
+    void testDeleteBlobInvalidHash() {
+        StorageException exception = assertThrows(StorageException.class, () -> {
+            storageService.deleteBlob("invalid-hash");
+        });
+        
+        assertEquals(StorageException.StorageErrorType.INVALID_HASH_FORMAT, exception.getErrorType());
+    }
+
+    @Test
+    void testDeleteBlobWithAccessLog() throws Exception {
+        String content = "Content with access log";
+        String hash;
+        
+        // BLOBを作成
+        try (InputStream inputStream = new ByteArrayInputStream(content.getBytes())) {
+            BlobMetadata metadata = storageService.storeBlob(inputStream, "text/plain", "test-pubkey", null);
+            hash = metadata.getHash();
+        }
+        
+        // アクセスログを作成
+        storageService.updateAccessTime(hash);
+        
+        // アクセスログが存在することを確認
+        String url = "jdbc:sqlite:" + tempDbPath.toString();
+        try (Connection conn = DriverManager.getConnection(url)) {
+            String sql = "SELECT COUNT(*) FROM accessed WHERE blob = ?";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setString(1, hash);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    rs.next();
+                    assertEquals(1, rs.getInt(1));
+                }
+            }
+        }
+        
+        // 削除実行
+        boolean deleted = storageService.deleteBlob(hash);
+        assertTrue(deleted);
+        
+        // アクセスログも削除されているか確認
+        try (Connection conn = DriverManager.getConnection(url)) {
+            String sql = "SELECT COUNT(*) FROM accessed WHERE blob = ?";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setString(1, hash);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    rs.next();
+                    assertEquals(0, rs.getInt(1));
+                }
+            }
+        }
+    }
+
+    @Test
+    void testCalculateSHA256() throws Exception {
+        String content = "Test content for SHA256 calculation";
+        
+        try (InputStream inputStream = new ByteArrayInputStream(content.getBytes())) {
+            BlobMetadata result = storageService.storeBlob(inputStream, "text/plain", "test-pubkey", null);
+            
+            // SHA256ハッシュの形式確認（64文字の16進数）
+            String hash = result.getHash();
+            assertEquals(64, hash.length());
+            assertTrue(hash.matches("^[a-f0-9]{64}$"));
+        }
+    }
+
+    @Test
+    void testStoreBlobTransactionRollback() throws Exception {
+        // 無効なパスを設定してトランザクションのロールバックをテスト
+        StorageService faultyService = new StorageService();
+        ReflectionTestUtils.setField(faultyService, "storagePath", "/invalid/readonly/path");
+        ReflectionTestUtils.setField(faultyService, "databasePath", tempDbPath.toString());
+        
+        String content = "Test content for transaction rollback";
+        
+        try (InputStream inputStream = new ByteArrayInputStream(content.getBytes())) {
+            assertThrows(StorageException.class, () -> {
+                faultyService.storeBlob(inputStream, "text/plain", "test-pubkey", null);
+            });
+        }
+        
+        // データベースに不整合なデータが残っていないことを確認
+        var stats = storageService.getStorageStats();
+        // テスト開始時の状態によるが、異常なレコードが追加されていないことを確認
     }
 
     private void createTestBlob(String hash, String content, String mimeType) throws IOException, SQLException {

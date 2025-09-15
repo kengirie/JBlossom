@@ -5,6 +5,7 @@ import io.github.kengirie.JBlossom.model.BlobContent;
 import io.github.kengirie.JBlossom.model.BlobMetadata;
 import io.github.kengirie.JBlossom.service.NostrAuthService;
 import io.github.kengirie.JBlossom.service.StorageService;
+import io.github.kengirie.JBlossom.exception.AuthenticationException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -16,6 +17,8 @@ import org.springframework.core.io.Resource;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.util.Optional;
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -147,8 +150,10 @@ public class BlobControllerTest {
     @Test
     void testWithValidAuth() throws Exception {
         String authHeader = "Nostr eyJraW5kIjoyNDI0Mn0="; // base64 encoded mock
+        Map<String, String> tags = new HashMap<>();
+        tags.put("t", "get");
         AuthResult authResult = AuthResult.valid("test-pubkey", System.currentTimeMillis() / 1000,
-                                                System.currentTimeMillis() / 1000 + 3600, "get");
+                                                System.currentTimeMillis() / 1000 + 3600, "get", tags);
 
         when(nostrAuthService.validateAuthEvent(authHeader, "get")).thenReturn(authResult);
         when(storageService.findBlob(VALID_HASH)).thenReturn(Optional.of(testMetadata));
@@ -165,7 +170,7 @@ public class BlobControllerTest {
     @Test
     void testWithInvalidAuth() throws Exception {
         String authHeader = "Nostr invalid";
-        AuthResult authResult = AuthResult.invalid("Invalid signature");
+        AuthResult authResult = AuthResult.invalid("Invalid signature", AuthenticationException.AuthErrorType.INVALID_SIGNATURE);
 
         when(nostrAuthService.validateAuthEvent(authHeader, "get")).thenReturn(authResult);
         when(storageService.findBlob(VALID_HASH)).thenReturn(Optional.of(testMetadata));

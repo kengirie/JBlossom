@@ -9,7 +9,10 @@ public class StorageException extends RuntimeException {
         HASH_MISMATCH("File hash does not match expected SHA256"),
         DATABASE_ERROR("Database operation failed"),
         INVALID_HASH_FORMAT("Invalid SHA256 hash format"),
-        STORAGE_UNAVAILABLE("Storage system unavailable");
+        STORAGE_UNAVAILABLE("Storage system unavailable"),
+        FILE_TOO_LARGE("File size exceeds maximum allowed size"),
+        INVALID_FILE("Invalid file or file is empty"),
+        STORAGE_ERROR("Storage operation failed");
         
         private final String defaultMessage;
         

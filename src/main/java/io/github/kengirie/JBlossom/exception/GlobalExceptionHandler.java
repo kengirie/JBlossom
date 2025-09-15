@@ -97,7 +97,9 @@ public class GlobalExceptionHandler {
         HttpStatus status = switch (ex.getErrorType()) {
             case BLOB_NOT_FOUND, INVALID_HASH_FORMAT -> HttpStatus.NOT_FOUND;
             case FILE_CORRUPTED, HASH_MISMATCH -> HttpStatus.UNPROCESSABLE_ENTITY;
-            case STORAGE_UNAVAILABLE, DATABASE_ERROR, FILE_READ_ERROR -> HttpStatus.INTERNAL_SERVER_ERROR;
+            case FILE_TOO_LARGE -> HttpStatus.PAYLOAD_TOO_LARGE;
+            case INVALID_FILE -> HttpStatus.BAD_REQUEST;
+            case STORAGE_UNAVAILABLE, DATABASE_ERROR, FILE_READ_ERROR, STORAGE_ERROR -> HttpStatus.INTERNAL_SERVER_ERROR;
         };
         
         return createErrorResponse(status, "Storage Error", ex.getMessage(), ex.getXReasonHeader());

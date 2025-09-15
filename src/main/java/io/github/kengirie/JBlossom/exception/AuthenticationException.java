@@ -11,7 +11,9 @@ public class AuthenticationException extends RuntimeException {
         INVALID_FORMAT("Invalid auth event format"),
         MALFORMED_BASE64("Malformed base64 encoding"),
         TIMESTAMP_FUTURE("Event timestamp is in the future"),
-        MISSING_AUTHORIZATION("Missing Authorization header");
+        MISSING_AUTHORIZATION("Missing Authorization header"),
+        MISSING_AUTH("Authorization required for this operation"),
+        HASH_MISMATCH("SHA256 hash mismatch in auth event");
         
         private final String defaultMessage;
         

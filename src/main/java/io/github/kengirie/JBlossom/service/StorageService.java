@@ -2,6 +2,7 @@ package io.github.kengirie.JBlossom.service;
 
 import io.github.kengirie.JBlossom.model.BlobContent;
 import io.github.kengirie.JBlossom.model.BlobMetadata;
+import io.github.kengirie.JBlossom.exception.StorageException;
 import io.github.kengirie.JBlossom.util.RangeRequestParser;
 import io.github.kengirie.JBlossom.util.RangeRequestParser.Range;
 
@@ -23,6 +24,12 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.Optional;
+import java.io.InputStream;
+import java.io.IOException;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 @Service
 public class StorageService {
@@ -252,6 +259,172 @@ public class StorageService {
         }
 
         return new StorageStats(0, 0);
+    }
+
+    public BlobMetadata storeBlob(InputStream inputStream, String contentType, String uploaderPubkey, String expectedSha256) 
+            throws StorageException {
+        
+        if (inputStream == null) {
+            throw new StorageException(StorageException.StorageErrorType.INVALID_FILE, null, "InputStream is null");
+        }
+
+        // 一時ファイルに保存しながらSHA256を計算
+        Path tempPath = null;
+        String calculatedSha256;
+        long fileSize;
+        
+        try {
+            // 一時ファイル作成
+            tempPath = Files.createTempFile("blossom-upload-", ".tmp");
+            
+            // ファイル書き込みとSHA256計算を同時実行
+            try (FileOutputStream fos = new FileOutputStream(tempPath.toFile())) {
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                fileSize = 0;
+                
+                while ((bytesRead = inputStream.read(buffer)) != -1) {
+                    fos.write(buffer, 0, bytesRead);
+                    digest.update(buffer, 0, bytesRead);
+                    fileSize += bytesRead;
+                }
+                
+                // SHA256計算完了
+                byte[] hashBytes = digest.digest();
+                calculatedSha256 = bytesToHex(hashBytes);
+                
+            } catch (NoSuchAlgorithmException e) {
+                throw new StorageException(StorageException.StorageErrorType.STORAGE_ERROR, null, 
+                    "SHA-256 algorithm not available", e);
+            }
+            
+            // 期待されたSHA256との整合性チェック
+            if (expectedSha256 != null && !expectedSha256.equalsIgnoreCase(calculatedSha256)) {
+                throw new StorageException(StorageException.StorageErrorType.HASH_MISMATCH, calculatedSha256,
+                    String.format("SHA256 mismatch: expected %s, calculated %s", expectedSha256, calculatedSha256));
+            }
+            
+            // 既存のBLOBがあるかチェック
+            Optional<BlobMetadata> existing = findBlob(calculatedSha256);
+            if (existing.isPresent()) {
+                logger.debug("Blob already exists: {}", calculatedSha256);
+                return existing.get();
+            }
+            
+            // 最終保存先のパス
+            Path finalPath = getFilePath(calculatedSha256);
+            
+            // ディレクトリ作成
+            Files.createDirectories(finalPath.getParent());
+            
+            // 一時ファイルを最終位置に移動
+            Files.move(tempPath, finalPath);
+            
+            // データベースに記録
+            BlobMetadata metadata = new BlobMetadata(
+                calculatedSha256,
+                fileSize,
+                contentType,
+                Instant.now().getEpochSecond(),
+                uploaderPubkey
+            );
+            
+            saveBlobMetadata(metadata);
+            
+            logger.info("Blob stored successfully: {} ({} bytes)", calculatedSha256, fileSize);
+            return metadata;
+            
+        } catch (IOException e) {
+            throw new StorageException(StorageException.StorageErrorType.STORAGE_ERROR, null, 
+                "Failed to store blob", e);
+        } finally {
+            // 一時ファイル削除
+            if (tempPath != null && Files.exists(tempPath)) {
+                try {
+                    Files.delete(tempPath);
+                } catch (IOException e) {
+                    logger.warn("Failed to delete temporary file: {}", tempPath, e);
+                }
+            }
+        }
+    }
+
+    public boolean deleteBlob(String sha256Hash) throws StorageException {
+        if (!isValidSha256(sha256Hash)) {
+            throw new StorageException(StorageException.StorageErrorType.INVALID_HASH_FORMAT, sha256Hash);
+        }
+
+        // BLOBの存在確認
+        Optional<BlobMetadata> metadata = findBlob(sha256Hash);
+        if (metadata.isEmpty()) {
+            return false; // 既に存在しない
+        }
+
+        try (Connection conn = getConnection()) {
+            conn.setAutoCommit(false);
+            
+            try {
+                // データベースから削除
+                String deleteMetadata = "DELETE FROM blobs WHERE hash = ?";
+                try (PreparedStatement stmt = conn.prepareStatement(deleteMetadata)) {
+                    stmt.setString(1, sha256Hash);
+                    stmt.executeUpdate();
+                }
+                
+                // アクセスログも削除
+                String deleteAccess = "DELETE FROM accessed WHERE blob = ?";
+                try (PreparedStatement stmt = conn.prepareStatement(deleteAccess)) {
+                    stmt.setString(1, sha256Hash);
+                    stmt.executeUpdate();
+                }
+                
+                // 物理ファイル削除
+                Path filePath = getFilePath(sha256Hash);
+                if (Files.exists(filePath)) {
+                    Files.delete(filePath);
+                }
+                
+                conn.commit();
+                logger.info("Blob deleted successfully: {}", sha256Hash);
+                return true;
+                
+            } catch (Exception e) {
+                conn.rollback();
+                throw e;
+            }
+            
+        } catch (SQLException | IOException e) {
+            throw new StorageException(StorageException.StorageErrorType.STORAGE_ERROR, sha256Hash, 
+                "Failed to delete blob", e);
+        }
+    }
+
+    private void saveBlobMetadata(BlobMetadata metadata) throws StorageException {
+        try (Connection conn = getConnection()) {
+            String sql = "INSERT INTO blobs (hash, size, type, uploaded, pubkey) VALUES (?, ?, ?, ?, ?)";
+            try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+                stmt.setString(1, metadata.getHash());
+                stmt.setLong(2, metadata.getSize());
+                stmt.setString(3, metadata.getType());
+                stmt.setLong(4, metadata.getUploaded());
+                stmt.setString(5, metadata.getPubkey());
+                
+                stmt.executeUpdate();
+            }
+        } catch (SQLException e) {
+            throw new StorageException(StorageException.StorageErrorType.DATABASE_ERROR, metadata.getHash(), 
+                "Failed to save blob metadata", e);
+        }
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder result = new StringBuilder();
+        for (byte b : bytes) {
+            result.append(String.format("%02x", b));
+        }
+        return result.toString();
     }
 
     public static class StorageStats {

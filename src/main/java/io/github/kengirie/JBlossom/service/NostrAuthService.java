@@ -1,6 +1,7 @@
 package io.github.kengirie.JBlossom.service;
 
 import io.github.kengirie.JBlossom.model.AuthResult;
+import io.github.kengirie.JBlossom.exception.AuthenticationException;
 import org.springframework.stereotype.Service;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -10,9 +11,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 
 import java.util.Base64;
 import java.time.Instant;
-import java.util.List;
-import java.util.Optional;
 import java.util.regex.Pattern;
+import java.util.Map;
+import java.util.HashMap;
 
 @Service
 public class NostrAuthService {
@@ -33,17 +34,17 @@ public class NostrAuthService {
     
     public AuthResult validateAuthEvent(String authHeader, String requiredAction, String requiredHash) {
         if (authHeader == null || authHeader.isBlank()) {
-            return AuthResult.invalid("Missing Authorization header");
+            return AuthResult.invalid("Missing Authorization header", AuthenticationException.AuthErrorType.MISSING_AUTH);
         }
         
         // Authorization: Nostr <base64_event> の形式をチェック
         if (!authHeader.startsWith("Nostr ")) {
-            return AuthResult.invalid("Invalid Authorization scheme, expected 'Nostr'");
+            return AuthResult.invalid("Invalid Authorization scheme, expected 'Nostr'", AuthenticationException.AuthErrorType.INVALID_FORMAT);
         }
         
         String base64Event = authHeader.substring(6).trim();
         if (base64Event.isBlank()) {
-            return AuthResult.invalid("Missing event data in Authorization header");
+            return AuthResult.invalid("Missing event data in Authorization header", AuthenticationException.AuthErrorType.INVALID_FORMAT);
         }
         
         try {
@@ -84,48 +85,49 @@ public class NostrAuthService {
             String pubkey = eventNode.get("pubkey").asText();
             long createdAt = eventNode.get("created_at").asLong();
             long expiration = getExpirationFromTags(eventNode);
+            Map<String, String> tags = extractTagsMap(eventNode);
             
             logger.info("Valid auth event for pubkey: {}, action: {}", pubkey, requiredAction);
-            return AuthResult.valid(pubkey, createdAt, expiration, requiredAction);
+            return AuthResult.valid(pubkey, createdAt, expiration, requiredAction, tags);
             
         } catch (Exception e) {
             logger.error("Failed to validate auth event", e);
-            return AuthResult.invalid("Invalid event format: " + e.getMessage());
+            return AuthResult.invalid("Invalid event format: " + e.getMessage(), AuthenticationException.AuthErrorType.INVALID_FORMAT);
         }
     }
     
     private AuthResult validateBasicFields(JsonNode eventNode) {
         // kind フィールドチェック
         if (!eventNode.has("kind") || eventNode.get("kind").asInt() != KIND_AUTH) {
-            return AuthResult.invalid("Invalid kind, expected " + KIND_AUTH);
+            return AuthResult.invalid("Invalid kind, expected " + KIND_AUTH, AuthenticationException.AuthErrorType.INVALID_KIND);
         }
         
         // pubkey フィールドチェック
         if (!eventNode.has("pubkey")) {
-            return AuthResult.invalid("Missing pubkey field");
+            return AuthResult.invalid("Missing pubkey field", AuthenticationException.AuthErrorType.INVALID_FORMAT);
         }
         
         String pubkey = eventNode.get("pubkey").asText();
         if (!HEX_PATTERN.matcher(pubkey).matches()) {
-            return AuthResult.invalid("Invalid pubkey format, expected 64-char hex");
+            return AuthResult.invalid("Invalid pubkey format, expected 64-char hex", AuthenticationException.AuthErrorType.INVALID_FORMAT);
         }
         
         // created_at フィールドチェック
         if (!eventNode.has("created_at")) {
-            return AuthResult.invalid("Missing created_at field");
+            return AuthResult.invalid("Missing created_at field", AuthenticationException.AuthErrorType.INVALID_FORMAT);
         }
         
         // content フィールドチェック
         if (!eventNode.has("content")) {
-            return AuthResult.invalid("Missing content field");
+            return AuthResult.invalid("Missing content field", AuthenticationException.AuthErrorType.INVALID_FORMAT);
         }
         
         // signature フィールドチェック
         if (!eventNode.has("sig")) {
-            return AuthResult.invalid("Missing signature field");
+            return AuthResult.invalid("Missing signature field", AuthenticationException.AuthErrorType.INVALID_FORMAT);
         }
         
-        return AuthResult.valid(pubkey, 0, 0, null);
+        return AuthResult.valid(pubkey, 0, 0, null, null);
     }
     
     private AuthResult validateTimestamps(JsonNode eventNode) {
@@ -134,26 +136,26 @@ public class NostrAuthService {
         // created_at は過去でなければならない
         long createdAt = eventNode.get("created_at").asLong();
         if (createdAt > now + 60) { // 1分の誤差を許容
-            return AuthResult.invalid("created_at must be in the past");
+            return AuthResult.invalid("created_at must be in the past", AuthenticationException.AuthErrorType.TIMESTAMP_FUTURE);
         }
         
         // expiration タグから有効期限を取得
         long expiration = getExpirationFromTags(eventNode);
         if (expiration == 0) {
-            return AuthResult.invalid("Missing expiration tag");
+            return AuthResult.invalid("Missing expiration tag", AuthenticationException.AuthErrorType.MISSING_TAGS);
         }
         
         // expiration は未来でなければならない
         if (expiration <= now) {
-            return AuthResult.invalid("Event has expired");
+            return AuthResult.invalid("Event has expired", AuthenticationException.AuthErrorType.EVENT_EXPIRED);
         }
         
-        return AuthResult.valid(null, createdAt, expiration, null);
+        return AuthResult.valid(null, createdAt, expiration, null, null);
     }
     
     private AuthResult validateTags(JsonNode eventNode, String requiredAction, String requiredHash) {
         if (!eventNode.has("tags") || !eventNode.get("tags").isArray()) {
-            return AuthResult.invalid("Missing or invalid tags field");
+            return AuthResult.invalid("Missing or invalid tags field", AuthenticationException.AuthErrorType.MISSING_TAGS);
         }
         
         JsonNode tagsArray = eventNode.get("tags");
@@ -189,18 +191,18 @@ public class NostrAuthService {
         }
         
         if (!foundTTag) {
-            return AuthResult.invalid("Missing or invalid 't' tag for action: " + requiredAction);
+            return AuthResult.invalid("Missing or invalid 't' tag for action: " + requiredAction, AuthenticationException.AuthErrorType.INVALID_ACTION);
         }
         
         if (!foundExpirationTag) {
-            return AuthResult.invalid("Missing expiration tag");
+            return AuthResult.invalid("Missing expiration tag", AuthenticationException.AuthErrorType.MISSING_TAGS);
         }
         
         if (!hashValidation) {
-            return AuthResult.invalid("Missing 'x' tag for required hash: " + requiredHash);
+            return AuthResult.invalid("Missing 'x' tag for required hash: " + requiredHash, AuthenticationException.AuthErrorType.MISSING_TAGS);
         }
         
-        return AuthResult.valid(null, 0, 0, requiredAction);
+        return AuthResult.valid(null, 0, 0, requiredAction, null);
     }
     
     private long getExpirationFromTags(JsonNode eventNode) {
@@ -232,18 +234,37 @@ public class NostrAuthService {
             String signature = eventNode.get("sig").asText();
             
             if (!HEX_PATTERN.matcher(signature).matches() && signature.length() != 128) {
-                return AuthResult.invalid("Invalid signature format");
+                return AuthResult.invalid("Invalid signature format", AuthenticationException.AuthErrorType.INVALID_SIGNATURE);
             }
             
             // 署名検証の詳細実装は後のコミットで追加
             logger.warn("Signature validation not yet fully implemented");
             
-            return AuthResult.valid(pubkey, 0, 0, null);
+            return AuthResult.valid(pubkey, 0, 0, null, null);
             
         } catch (Exception e) {
             logger.error("Signature validation failed", e);
-            return AuthResult.invalid("Signature validation error: " + e.getMessage());
+            return AuthResult.invalid("Signature validation error: " + e.getMessage(), AuthenticationException.AuthErrorType.INVALID_SIGNATURE);
         }
+    }
+    
+    private Map<String, String> extractTagsMap(JsonNode eventNode) {
+        Map<String, String> tagsMap = new HashMap<>();
+        
+        if (!eventNode.has("tags") || !eventNode.get("tags").isArray()) {
+            return tagsMap;
+        }
+        
+        JsonNode tagsArray = eventNode.get("tags");
+        for (JsonNode tag : tagsArray) {
+            if (tag.isArray() && tag.size() >= 2) {
+                String tagName = tag.get(0).asText();
+                String tagValue = tag.get(1).asText();
+                tagsMap.put(tagName, tagValue);
+            }
+        }
+        
+        return tagsMap;
     }
     
     // ユーティリティメソッド: Nostr eventの検証のみ（action不問）
