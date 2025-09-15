@@ -1,5 +1,6 @@
 package io.github.kengirie.JBlossom.util;
 
+import io.github.kengirie.JBlossom.exception.RangeNotSatisfiableException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
